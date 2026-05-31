@@ -24,6 +24,7 @@ from nbes_engine import (
     posterior_from_signals,
 )
 from price_feed import fetch_btc_spot
+from hl_outcomes import get_outcome_prices
 
 st.set_page_config(page_title="NBES — Bayesian Edge", page_icon="📊", layout="wide")
 
@@ -32,6 +33,14 @@ st.set_page_config(page_title="NBES — Bayesian Edge", page_icon="📊", layout
 def get_live_btc(_nonce: int = 0) -> dict:
     """Cached live BTC spot. ttl=30s; _nonce lets a button force a refresh."""
     return fetch_btc_spot()
+
+
+@st.cache_data(ttl=20, show_spinner="Fetching live quotes from Hyperliquid…")
+def get_live_quotes(keyword_items: tuple, _nonce: int = 0) -> dict:
+    """Cached live HIP-4 outcome prices. ttl=20s; _nonce forces refresh.
+    keyword_items is a hashable tuple of (bucket, (kw, kw, ...))."""
+    keyword_map = {b: list(kws) for b, kws in keyword_items}
+    return get_outcome_prices(keyword_map)
 
 # ---------------------------------------------------------------------------
 # styling
@@ -169,6 +178,21 @@ elif market_type == "BTC range (3-way)":
     cat_kind = "btc_range"
 is_categorical = cat_kind is not None
 
+# keyword maps used to match the live Hyperliquid outcome books by description.
+# These are best-effort; the UI shows what resolved so you can correct them.
+QUOTE_KEYWORDS = {
+    "btc_range": {
+        "below":    ["BTC", "below", "72551"],
+        "in_range": ["BTC", "72551", "75512"],
+        "above":    ["BTC", "above", "75512"],
+    },
+    "cpi": {
+        "below":   ["CPI", "below", "4.3"],
+        "exactly": ["CPI", "4.3"],
+        "above":   ["CPI", "above", "4.3"],
+    },
+}
+
 # market presets pulled from the live books in the screenshots
 BTC_PRESETS = {
     "BTC > 74032": {"strike": 74032.0, "yes_mkt": 0.05, "hours": 11.0, "direction": "above"},
@@ -230,15 +254,42 @@ if not is_categorical:
         st.subheader("2 · Market book")
         st.caption("👉 The current price on Hyperliquid. Remember: a price of "
                    "0.05 means the market thinks there's a 5% chance.")
-        st.caption(f"Screenshot shows YES ({direction}) ≈ **{preset['yes_mkt']:.0%}**. "
-                   "Enter your observed bid/ask.")
+
+        if "quote_nonce" not in st.session_state:
+            st.session_state.quote_nonce = 0
+        bqc1, bqc2 = st.columns([3, 1])
+        use_live_bin = bqc1.checkbox(
+            "Use live Hyperliquid quote", value=False,
+            help="Fetch the current YES price for this contract from Hyperliquid.")
+        if bqc2.button("↻ Refresh quote",
+                       help="Re-fetch the latest contract price now."):
+            st.session_state.quote_nonce += 1
+            st.rerun()
+
+        live_yes = None
+        if use_live_bin:
+            kw_items = (("yes", ("BTC", "74032")),)
+            q = get_live_quotes(kw_items, st.session_state.quote_nonce)
+            if q["ok"] and q["prices"].get("yes") is not None:
+                live_yes = float(q["prices"]["yes"])
+                age = (datetime.now(timezone.utc) - q["ts"]).total_seconds()
+                st.success(f"🟢 Live YES mid ${live_yes:.3f} "
+                           f"({q['resolved'].get('yes') or '?'}, {age:.0f}s ago)")
+            else:
+                st.warning(f"⚠️ Couldn't match this market live "
+                           f"({q.get('error') or 'no price'}). Using manual entry.")
+
+        base = live_yes if live_yes is not None else preset["yes_mkt"]
+        if live_yes is None:
+            st.caption(f"Screenshot shows YES ({direction}) ≈ **{preset['yes_mkt']:.0%}**. "
+                       "Enter your observed bid/ask.")
         c1, c2 = st.columns(2)
         yes_bid = c1.number_input(
-            "YES bid", 0.0, 1.0, max(0.0, preset["yes_mkt"] - 0.01), step=0.01,
+            "YES bid", 0.0, 1.0, max(0.0, base - 0.01), step=0.01,
             help="Highest price someone will pay you for a YES contract (where you "
                  "could sell).")
         yes_ask = c2.number_input(
-            "YES ask", 0.0, 1.0, min(1.0, preset["yes_mkt"] + 0.01), step=0.01,
+            "YES ask", 0.0, 1.0, min(1.0, base + 0.01), step=0.01,
             help="Lowest price you can buy a YES contract for (where you could buy).")
         mid = 0.5 * (yes_bid + yes_ask)
         spread = yes_ask - yes_bid
@@ -335,17 +386,56 @@ else:
 
     with right:
         st.subheader("2 · Market book (per bucket)")
-        st.caption("👉 The price of each of the three outcomes. Enter what the "
-                   "market is charging for each.")
-        scr = " · ".join(f"{bucket_labels[k]} {default_prices[k]:.0%}"
-                         for k in bucket_keys)
-        st.caption(f"Prices from screenshot: {scr}.")
+        st.caption("👉 The price of each of the three outcomes. Pull them live "
+                   "from Hyperliquid, or enter manually.")
+
+        if "quote_nonce" not in st.session_state:
+            st.session_state.quote_nonce = 0
+        kw_items = tuple((b, tuple(kws))
+                         for b, kws in QUOTE_KEYWORDS[cat_kind].items())
+
+        qc1, qc2 = st.columns([3, 1])
+        use_live = qc1.checkbox(
+            "Use live Hyperliquid quotes", value=False,
+            help="Fetch current contract prices from Hyperliquid's HIP-4 books. "
+                 "If a market can't be matched, that price falls back to manual.")
+        if qc2.button("↻ Refresh quotes",
+                      help="Re-fetch the latest contract prices now."):
+            st.session_state.quote_nonce += 1
+            st.rerun()
+
+        live_prices = {}
+        if use_live:
+            q = get_live_quotes(kw_items, st.session_state.quote_nonce)
+            if q["ok"]:
+                age = (datetime.now(timezone.utc) - q["ts"]).total_seconds()
+                got = {k: v for k, v in q["prices"].items() if v is not None}
+                st.success(f"🟢 Live: {len(got)}/{len(bucket_keys)} outcomes "
+                           f"matched ({age:.0f}s ago)")
+                live_prices = got
+                # show what resolved so the user can verify the match
+                res_txt = " · ".join(
+                    f"{bucket_labels[k]}→{q['resolved'].get(k) or '—'}"
+                    for k in bucket_keys)
+                st.caption(f"Resolved coins: {res_txt}")
+                missing = [bucket_labels[k] for k in bucket_keys
+                           if k not in live_prices]
+                if missing:
+                    st.warning("Couldn't match: " + ", ".join(missing)
+                               + " — enter these manually below.")
+            else:
+                st.warning(f"⚠️ Live quotes unavailable ({q['error']}). "
+                           "Using manual entry.")
+
         mkt_buckets = {}
         for k in bucket_keys:
+            dflt = float(live_prices.get(k, default_prices[k]))
             mkt_buckets[k] = st.number_input(
-                f"{bucket_labels[k]} price", 0.0, 1.0, default_prices[k], step=0.01,
+                f"{bucket_labels[k]} price", 0.0, 1.0, dflt, step=0.01,
+                key=f"price_{cat_kind}_{k}",
                 help=f"Market price for the '{bucket_labels[k]}' outcome "
-                     f"(0.50 = 50% implied chance).")
+                     f"(0.50 = 50% implied chance). "
+                     f"{'Auto-filled from Hyperliquid.' if k in live_prices else ''}")
         book_sum = sum(mkt_buckets.values())
         over = book_sum - 1
         st.caption(f"Book sums to **{book_sum:.2f}** "
