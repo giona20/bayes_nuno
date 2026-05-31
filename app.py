@@ -5,6 +5,8 @@ Run: streamlit run app.py
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -20,8 +22,15 @@ from nbes_engine import (
     logit,
     posterior_from_signals,
 )
+from price_feed import fetch_btc_spot
 
 st.set_page_config(page_title="NBES — Bayesian Edge", page_icon="📊", layout="wide")
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_live_btc(_nonce: int = 0) -> dict:
+    """Cached live BTC spot. ttl=30s; _nonce lets a button force a refresh."""
+    return fetch_btc_spot()
 
 # ---------------------------------------------------------------------------
 # styling
@@ -143,8 +152,10 @@ with st.sidebar:
 
 market_type = st.radio(
     "Market (live HIP-4 books, Jun 1 8:00 AM / Jun 10 CPI)",
-    ["BTC > 74032 (binary)", "BTC > 72551 (binary)", "May CPI YoY (3-way)"],
+    ["BTC > 74032", "BTC > 72551 (above)", "BTC < 72551 (below)", "May CPI YoY (3-way)"],
     horizontal=True,
+    help="The three BTC options are yes/no bets on where Bitcoin's price lands. "
+         "'Above'/'below' are the two sides of the same range market.",
 )
 
 # ---------------------------------------------------------------------------
@@ -153,9 +164,11 @@ market_type = st.radio(
 is_categorical = market_type == "May CPI YoY (3-way)"
 
 # market presets pulled from the live books in the screenshot
+# direction: "above" = YES means price ends above strike; "below" = YES means below
 BTC_PRESETS = {
-    "BTC > 74032 (binary)": {"strike": 74032.0, "yes_mkt": 0.05, "hours": 11.0},
-    "BTC > 72551 (binary)": {"strike": 72551.0, "yes_mkt": 0.06, "hours": 11.0},
+    "BTC > 74032":         {"strike": 74032.0, "yes_mkt": 0.05, "hours": 11.0, "direction": "above"},
+    "BTC > 72551 (above)": {"strike": 72551.0, "yes_mkt": 0.06, "hours": 11.0, "direction": "above"},
+    "BTC < 72551 (below)": {"strike": 72551.0, "yes_mkt": 0.93, "hours": 11.0, "direction": "below"},
 }
 
 # ---------------------------------------------------------------------------
@@ -169,28 +182,61 @@ if not is_categorical:
         st.subheader("1 · Prior (independent of the book)")
         st.caption("👉 The tool's first-guess probability, before looking at the "
                    "market price. Just enter today's Bitcoin price and the target.")
+        direction = preset["direction"]
+
+        # ---- live price ----
+        if "px_nonce" not in st.session_state:
+            st.session_state.px_nonce = 0
+        live = get_live_btc(st.session_state.px_nonce)
+        pc1, pc2 = st.columns([3, 1])
+        if live["ok"]:
+            age = (datetime.now(timezone.utc) - live["ts"]).total_seconds()
+            pc1.success(f"🟢 Live BTC ${live['price']:,.0f} "
+                        f"({live['source']}, {age:.0f}s ago)")
+            default_spot = float(round(live["price"]))
+        else:
+            pc1.warning("⚠️ Live price unavailable — enter spot manually below.")
+            default_spot = 73_000.0
+        if pc2.button("↻ Refresh", help="Fetch the latest BTC price now."):
+            st.session_state.px_nonce += 1
+            st.rerun()
+
         c1, c2 = st.columns(2)
-        spot = c1.number_input("BTC spot", 1.0, 1_000_000.0, 73_000.0, step=50.0)
-        strike = c2.number_input("Strike (>)", 1.0, 1_000_000.0,
-                                 preset["strike"], step=50.0)
+        spot = c1.number_input(
+            "BTC spot", 1.0, 1_000_000.0, default_spot, step=50.0,
+            help="Bitcoin's current price. Auto-filled from live data (refreshes "
+                 "every 30s); you can override it manually.")
+        rel = ">" if direction == "above" else "<"
+        strike = c2.number_input(
+            f"Target price ({rel})", 1.0, 1_000_000.0, preset["strike"], step=50.0,
+            help=f"The price level the bet is about. YES wins if Bitcoin ends "
+                 f"{direction} this number.")
         c3, c4 = st.columns(2)
-        hours = c3.number_input("Hours to expiry (→ Jun 1 8:00 AM)", 0.0, 168.0,
-                                preset["hours"], step=0.5)
-        vol = c4.slider("Annual vol σ", 0.10, 2.00, 0.55, 0.01)
-        prior = btc_lognormal_prior(spot, strike, hours, vol)
-        st.caption(f"Lognormal P(BTC > {strike:,.0f} in {hours:.1f}h): **{prior:.3f}**")
+        hours = c3.number_input(
+            "Hours to expiry (→ Jun 1 8:00 AM)", 0.0, 168.0, preset["hours"], step=0.5,
+            help="How many hours until the bet settles. Less time = less can change.")
+        vol = c4.slider(
+            "Annual vol σ", 0.10, 2.00, 0.55, 0.01,
+            help="How jumpy Bitcoin is. Higher = bigger expected price swings. "
+                 "0.55 (55%) is a typical recent value. Leave as-is if unsure.")
+        p_above = btc_lognormal_prior(spot, strike, hours, vol)
+        prior = p_above if direction == "above" else 1.0 - p_above
+        st.caption(f"Lognormal P(BTC {rel} {strike:,.0f} in {hours:.1f}h): **{prior:.3f}**")
 
     with right:
         st.subheader("2 · Market book")
         st.caption("👉 The current price on Hyperliquid. Remember: a price of "
                    "0.05 means the market thinks there's a 5% chance.")
-        st.caption(f"Screenshot shows YES (above) ≈ **{preset['yes_mkt']:.0%}**. "
+        st.caption(f"Screenshot shows YES ({direction}) ≈ **{preset['yes_mkt']:.0%}**. "
                    "Enter your observed bid/ask.")
         c1, c2 = st.columns(2)
-        yes_bid = c1.number_input("YES bid", 0.0, 1.0,
-                                  max(0.0, preset["yes_mkt"] - 0.01), step=0.01)
-        yes_ask = c2.number_input("YES ask", 0.0, 1.0,
-                                  preset["yes_mkt"] + 0.01, step=0.01)
+        yes_bid = c1.number_input(
+            "YES bid", 0.0, 1.0, max(0.0, preset["yes_mkt"] - 0.01), step=0.01,
+            help="Highest price someone will pay you for a YES contract (where you "
+                 "could sell).")
+        yes_ask = c2.number_input(
+            "YES ask", 0.0, 1.0, min(1.0, preset["yes_mkt"] + 0.01), step=0.01,
+            help="Lowest price you can buy a YES contract for (where you could buy).")
         mid = 0.5 * (yes_bid + yes_ask)
         spread = yes_ask - yes_bid
         st.caption(f"Mid **{mid:.3f}** · spread **{spread:.3f}** "
@@ -210,15 +256,24 @@ else:
         st.caption("Market rounds to one decimal around a center (4.3%). "
                    "Buckets: below 4.25 / [4.25,4.35) / ≥4.35.")
         c1, c2 = st.columns(2)
-        consensus = c1.number_input("Consensus YoY %", -5.0, 20.0, 4.28, step=0.01)
-        dispersion = c2.number_input("Forecast dispersion (std)", 0.01, 2.0,
-                                     0.08, step=0.01)
+        consensus = c1.number_input(
+            "Consensus YoY %", -5.0, 20.0, 4.28, step=0.01,
+            help="The average forecast for the inflation number, from analysts.")
+        dispersion = c2.number_input(
+            "Forecast dispersion (std)", 0.01, 2.0, 0.08, step=0.01,
+            help="How much forecasters disagree. Higher = more uncertainty about "
+                 "the outcome.")
         c3, c4 = st.columns(2)
-        center = c3.number_input("Bucket center %", -5.0, 20.0, 4.30, step=0.05)
-        half_width = c4.number_input("Bucket half-width", 0.01, 0.50,
-                                     0.05, step=0.01)
-        hours = st.number_input("Hours to settlement (→ Jun 10 BLS)",
-                                0.0, 2000.0, 240.0, step=12.0)
+        center = c3.number_input(
+            "Bucket center %", -5.0, 20.0, 4.30, step=0.05,
+            help="The middle value the market rounds to (here 4.3%).")
+        half_width = c4.number_input(
+            "Bucket half-width", 0.01, 0.50, 0.05, step=0.01,
+            help="How wide the middle bucket is. 0.05 means 'exactly 4.3' covers "
+                 "4.25 up to 4.35.")
+        hours = st.number_input(
+            "Hours to settlement (→ Jun 10 BLS)", 0.0, 2000.0, 240.0, step=12.0,
+            help="Hours until the official inflation data is released and the bet settles.")
         prior_buckets = cpi_bucket_prior(consensus, dispersion, center, half_width)
         st.caption(" · ".join(f"{k} **{v:.3f}**" for k, v in prior_buckets.items()))
 
@@ -227,9 +282,15 @@ else:
         st.caption("👉 The price of each of the three answers. Enter what the "
                    "market is charging for each.")
         st.caption("Prices from screenshot: below 45% · exactly 41% · above 12%.")
-        below_mkt = st.number_input("Below 4.3 price", 0.0, 1.0, 0.45, step=0.01)
-        exactly_mkt = st.number_input("Exactly 4.3 price", 0.0, 1.0, 0.41, step=0.01)
-        above_mkt = st.number_input("Above 4.3 price", 0.0, 1.0, 0.12, step=0.01)
+        below_mkt = st.number_input(
+            "Below 4.3 price", 0.0, 1.0, 0.45, step=0.01,
+            help="Market price for the inflation number landing below 4.25%.")
+        exactly_mkt = st.number_input(
+            "Exactly 4.3 price", 0.0, 1.0, 0.41, step=0.01,
+            help="Market price for it landing in the 4.25–4.35 range.")
+        above_mkt = st.number_input(
+            "Above 4.3 price", 0.0, 1.0, 0.12, step=0.01,
+            help="Market price for it landing at or above 4.35%.")
         book_sum = below_mkt + exactly_mkt + above_mkt
         st.caption(f"Book sums to **{book_sum:.2f}** "
                    f"({'overround ' + format((book_sum-1)*100, '.0f') + '¢' if book_sum > 1 else 'underround'}).")
