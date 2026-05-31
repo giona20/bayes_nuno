@@ -61,6 +61,28 @@ def btc_lognormal_prior(spot: float, strike: float, hours_to_expiry: float,
     return float(norm.cdf(d))
 
 
+def btc_range_prior(spot: float, lower: float, upper: float,
+                    hours_to_expiry: float, annual_vol: float) -> dict[str, float]:
+    """Three-outcome prior for a BTC range market.
+
+    Buckets:
+        below   : price < lower
+        in_range: lower <= price <= upper
+        above   : price > upper
+
+    Built from the lognormal CDF. P(>x) = btc_lognormal_prior(...).
+    Returns probabilities summing to 1.0.
+    """
+    p_above_lower = btc_lognormal_prior(spot, lower, hours_to_expiry, annual_vol)
+    p_above_upper = btc_lognormal_prior(spot, upper, hours_to_expiry, annual_vol)
+    below = 1.0 - p_above_lower
+    above = p_above_upper
+    in_range = max(0.0, p_above_lower - p_above_upper)
+    total = below + in_range + above
+    # normalise to guard against tiny float drift
+    return {"below": below / total, "in_range": in_range / total, "above": above / total}
+
+
 def cpi_normal_prior(consensus: float, dispersion: float, threshold: float,
                      direction: Literal["above", "below"] = "above") -> float:
     """P(CPI YoY print {above|below} threshold) given a normal over forecasts.

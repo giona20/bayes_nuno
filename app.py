@@ -14,6 +14,7 @@ import streamlit as st
 from nbes_engine import (
     Signal,
     btc_lognormal_prior,
+    btc_range_prior,
     categorical_posterior,
     cpi_bucket_prior,
     cpi_normal_prior,
@@ -152,23 +153,25 @@ with st.sidebar:
 
 market_type = st.radio(
     "Market (live HIP-4 books, Jun 1 8:00 AM / Jun 10 CPI)",
-    ["BTC > 74032", "BTC > 72551 (above)", "BTC < 72551 (below)", "May CPI YoY (3-way)"],
+    ["BTC > 74032", "BTC range (3-way)", "May CPI YoY (3-way)"],
     horizontal=True,
-    help="The three BTC options are yes/no bets on where Bitcoin's price lands. "
-         "'Above'/'below' are the two sides of the same range market.",
+    help="'BTC > 74032' is a yes/no bet. 'BTC range' and 'May CPI' are 3-way "
+         "markets where the three outcomes add up to 100%.",
 )
 
 # ---------------------------------------------------------------------------
 # prior block
 # ---------------------------------------------------------------------------
-is_categorical = market_type == "May CPI YoY (3-way)"
+cat_kind = None
+if market_type == "May CPI YoY (3-way)":
+    cat_kind = "cpi"
+elif market_type == "BTC range (3-way)":
+    cat_kind = "btc_range"
+is_categorical = cat_kind is not None
 
-# market presets pulled from the live books in the screenshot
-# direction: "above" = YES means price ends above strike; "below" = YES means below
+# market presets pulled from the live books in the screenshots
 BTC_PRESETS = {
-    "BTC > 74032":         {"strike": 74032.0, "yes_mkt": 0.05, "hours": 11.0, "direction": "above"},
-    "BTC > 72551 (above)": {"strike": 72551.0, "yes_mkt": 0.06, "hours": 11.0, "direction": "above"},
-    "BTC < 72551 (below)": {"strike": 72551.0, "yes_mkt": 0.93, "hours": 11.0, "direction": "below"},
+    "BTC > 74032": {"strike": 74032.0, "yes_mkt": 0.05, "hours": 11.0, "direction": "above"},
 }
 
 # ---------------------------------------------------------------------------
@@ -245,56 +248,108 @@ if not is_categorical:
             st.warning("Spread exceeds 2× your edge threshold — likely untradeable.")
 
 # ---------------------------------------------------------------------------
-# CATEGORICAL PATH (CPI 3-way)
+# CATEGORICAL PATH (CPI 3-way  OR  BTC range 3-way)
 # ---------------------------------------------------------------------------
 else:
     left, right = st.columns([1, 1])
-    with left:
-        st.subheader("1 · Prior — 3-way bucket model")
-        st.caption("👉 This market has THREE possible answers, not yes/no. The "
-                   "tool splits your estimate across all three so they add to 100%.")
-        st.caption("Market rounds to one decimal around a center (4.3%). "
-                   "Buckets: below 4.25 / [4.25,4.35) / ≥4.35.")
-        c1, c2 = st.columns(2)
-        consensus = c1.number_input(
-            "Consensus YoY %", -5.0, 20.0, 4.28, step=0.01,
-            help="The average forecast for the inflation number, from analysts.")
-        dispersion = c2.number_input(
-            "Forecast dispersion (std)", 0.01, 2.0, 0.08, step=0.01,
-            help="How much forecasters disagree. Higher = more uncertainty about "
-                 "the outcome.")
-        c3, c4 = st.columns(2)
-        center = c3.number_input(
-            "Bucket center %", -5.0, 20.0, 4.30, step=0.05,
-            help="The middle value the market rounds to (here 4.3%).")
-        half_width = c4.number_input(
-            "Bucket half-width", 0.01, 0.50, 0.05, step=0.01,
-            help="How wide the middle bucket is. 0.05 means 'exactly 4.3' covers "
-                 "4.25 up to 4.35.")
-        hours = st.number_input(
-            "Hours to settlement (→ Jun 10 BLS)", 0.0, 2000.0, 240.0, step=12.0,
-            help="Hours until the official inflation data is released and the bet settles.")
-        prior_buckets = cpi_bucket_prior(consensus, dispersion, center, half_width)
-        st.caption(" · ".join(f"{k} **{v:.3f}**" for k, v in prior_buckets.items()))
+
+    if cat_kind == "cpi":
+        bucket_keys = ["below", "exactly", "above"]
+        bucket_labels = {"below": "Below 4.3", "exactly": "Exactly 4.3",
+                         "above": "Above 4.3"}
+        default_prices = {"below": 0.45, "exactly": 0.41, "above": 0.12}
+        with left:
+            st.subheader("1 · Prior — 3-way bucket model")
+            st.caption("👉 This market has THREE possible answers, not yes/no. The "
+                       "tool splits your estimate across all three so they add to 100%.")
+            st.caption("Market rounds to one decimal around a center (4.3%). "
+                       "Buckets: below 4.25 / [4.25,4.35) / ≥4.35.")
+            c1, c2 = st.columns(2)
+            consensus = c1.number_input(
+                "Consensus YoY %", -5.0, 20.0, 4.28, step=0.01,
+                help="The average forecast for the inflation number, from analysts.")
+            dispersion = c2.number_input(
+                "Forecast dispersion (std)", 0.01, 2.0, 0.08, step=0.01,
+                help="How much forecasters disagree. Higher = more uncertainty.")
+            c3, c4 = st.columns(2)
+            center = c3.number_input(
+                "Bucket center %", -5.0, 20.0, 4.30, step=0.05,
+                help="The middle value the market rounds to (here 4.3%).")
+            half_width = c4.number_input(
+                "Bucket half-width", 0.01, 0.50, 0.05, step=0.01,
+                help="How wide the middle bucket is. 0.05 means 'exactly 4.3' "
+                     "covers 4.25 up to 4.35.")
+            hours = st.number_input(
+                "Hours to settlement (→ Jun 10 BLS)", 0.0, 2000.0, 240.0, step=12.0,
+                help="Hours until the official inflation data is released.")
+            prior_buckets = cpi_bucket_prior(consensus, dispersion, center, half_width)
+            st.caption(" · ".join(f"{bucket_labels[k]} **{prior_buckets[k]:.3f}**"
+                                  for k in bucket_keys))
+
+    else:  # btc_range
+        bucket_keys = ["below", "in_range", "above"]
+        bucket_labels = {"below": "Below 72551", "in_range": "72551–75512",
+                         "above": "Above 75512"}
+        default_prices = {"below": 0.08, "in_range": 0.93, "above": 0.01}
+        with left:
+            st.subheader("1 · Prior — 3-way range model")
+            st.caption("👉 This market has THREE outcomes: Bitcoin ends below the "
+                       "range, inside it, or above it. They add up to 100%.")
+            # live price
+            if "px_nonce" not in st.session_state:
+                st.session_state.px_nonce = 0
+            live = get_live_btc(st.session_state.px_nonce)
+            pc1, pc2 = st.columns([3, 1])
+            if live["ok"]:
+                age = (datetime.now(timezone.utc) - live["ts"]).total_seconds()
+                pc1.success(f"🟢 Live BTC ${live['price']:,.0f} "
+                            f"({live['source']}, {age:.0f}s ago)")
+                default_spot = float(round(live["price"]))
+            else:
+                pc1.warning("⚠️ Live price unavailable — enter spot manually.")
+                default_spot = 73_800.0
+            if pc2.button("↻ Refresh", help="Fetch the latest BTC price now."):
+                st.session_state.px_nonce += 1
+                st.rerun()
+            c1, c2 = st.columns(2)
+            spot = c1.number_input(
+                "BTC spot", 1.0, 1_000_000.0, default_spot, step=50.0,
+                help="Bitcoin's current price. Auto-filled from live data.")
+            vol = c2.slider(
+                "Annual vol σ", 0.10, 2.00, 0.55, 0.01,
+                help="How jumpy Bitcoin is. 0.55 (55%) is typical. Leave as-is "
+                     "if unsure.")
+            c3, c4 = st.columns(2)
+            lower = c3.number_input(
+                "Range lower", 1.0, 1_000_000.0, 72_551.0, step=50.0,
+                help="Bottom of the range. Below this = 'below' outcome.")
+            upper = c4.number_input(
+                "Range upper", 1.0, 1_000_000.0, 75_512.0, step=50.0,
+                help="Top of the range. Above this = 'above' outcome.")
+            hours = st.number_input(
+                "Hours to expiry (→ Jun 1 8:00 AM)", 0.0, 168.0, 11.0, step=0.5,
+                help="Hours until the bet settles.")
+            prior_buckets = btc_range_prior(spot, lower, upper, hours, vol)
+            st.caption(" · ".join(f"{bucket_labels[k]} **{prior_buckets[k]:.3f}**"
+                                  for k in bucket_keys))
 
     with right:
         st.subheader("2 · Market book (per bucket)")
-        st.caption("👉 The price of each of the three answers. Enter what the "
+        st.caption("👉 The price of each of the three outcomes. Enter what the "
                    "market is charging for each.")
-        st.caption("Prices from screenshot: below 45% · exactly 41% · above 12%.")
-        below_mkt = st.number_input(
-            "Below 4.3 price", 0.0, 1.0, 0.45, step=0.01,
-            help="Market price for the inflation number landing below 4.25%.")
-        exactly_mkt = st.number_input(
-            "Exactly 4.3 price", 0.0, 1.0, 0.41, step=0.01,
-            help="Market price for it landing in the 4.25–4.35 range.")
-        above_mkt = st.number_input(
-            "Above 4.3 price", 0.0, 1.0, 0.12, step=0.01,
-            help="Market price for it landing at or above 4.35%.")
-        book_sum = below_mkt + exactly_mkt + above_mkt
+        scr = " · ".join(f"{bucket_labels[k]} {default_prices[k]:.0%}"
+                         for k in bucket_keys)
+        st.caption(f"Prices from screenshot: {scr}.")
+        mkt_buckets = {}
+        for k in bucket_keys:
+            mkt_buckets[k] = st.number_input(
+                f"{bucket_labels[k]} price", 0.0, 1.0, default_prices[k], step=0.01,
+                help=f"Market price for the '{bucket_labels[k]}' outcome "
+                     f"(0.50 = 50% implied chance).")
+        book_sum = sum(mkt_buckets.values())
+        over = book_sum - 1
         st.caption(f"Book sums to **{book_sum:.2f}** "
-                   f"({'overround ' + format((book_sum-1)*100, '.0f') + '¢' if book_sum > 1 else 'underround'}).")
-        mkt_buckets = {"below": below_mkt, "exactly": exactly_mkt, "above": above_mkt}
+                   f"({'overround +' + format(over*100, '.0f') + '¢' if over > 0 else 'underround ' + format(over*100, '.0f') + '¢'}).")
 
 # ---------------------------------------------------------------------------
 # evidence / signals (shared)
@@ -306,16 +361,26 @@ st.caption("👉 Clues that adjust your guess. Each row is one clue: a **strengt
            "until calibrated on real data — don't trust the bet sizes yet.")
 if is_categorical:
     st.caption("For a 3-way market, evidence is log-evidence added to a chosen "
-               "bucket (which outcome it favours). Positive = makes that bucket "
-               "more likely. Wire to nowcast revisions / DXY / 2Y moves.")
-    default_signals = pd.DataFrame([
-        {"signal": "Cleveland nowcast revision", "llr": 0.00, "weight": 0.70,
-         "bucket": "above", "active": True},
-        {"signal": "DXY / 2Y move",              "llr": 0.00, "weight": 0.50,
-         "bucket": "above", "active": True},
-        {"signal": "Prior-month surprise carry", "llr": 0.00, "weight": 0.40,
-         "bucket": "below", "active": False},
-    ])
+               "outcome (which one it favours). Positive = makes that outcome "
+               "more likely.")
+    if cat_kind == "cpi":
+        default_signals = pd.DataFrame([
+            {"signal": "Cleveland nowcast revision", "llr": 0.00, "weight": 0.70,
+             "bucket": "above", "active": True},
+            {"signal": "DXY / 2Y move", "llr": 0.00, "weight": 0.50,
+             "bucket": "above", "active": True},
+            {"signal": "Prior-month surprise carry", "llr": 0.00, "weight": 0.40,
+             "bucket": "below", "active": False},
+        ])
+    else:  # btc_range
+        default_signals = pd.DataFrame([
+            {"signal": "Spot drift vs range", "llr": 0.00, "weight": 0.70,
+             "bucket": "in_range", "active": True},
+            {"signal": "Funding skew (Loris 34x)", "llr": 0.00, "weight": 0.50,
+             "bucket": "above", "active": True},
+            {"signal": "Realized-vol spike", "llr": 0.00, "weight": 0.40,
+             "bucket": "below", "active": False},
+        ])
     edited = st.data_editor(
         default_signals, num_rows="dynamic", width='stretch',
         column_config={
@@ -323,15 +388,14 @@ if is_categorical:
             "llr": st.column_config.NumberColumn("Log-ev", step=0.05, format="%.2f"),
             "weight": st.column_config.NumberColumn("Weight", min_value=0.0,
                                                     max_value=1.0, step=0.05, format="%.2f"),
-            "bucket": st.column_config.SelectboxColumn(
-                "Favours", options=["below", "exactly", "above"]),
+            "bucket": st.column_config.SelectboxColumn("Favours", options=bucket_keys),
             "active": st.column_config.CheckboxColumn("On"),
         },
-        key="signals_cat",
+        key=f"signals_cat_{cat_kind}",
     )
-    deltas = {"below": 0.0, "exactly": 0.0, "above": 0.0}
+    deltas = {k: 0.0 for k in bucket_keys}
     for _, row in edited.iterrows():
-        if bool(row["active"]):
+        if bool(row["active"]) and row["bucket"] in deltas:
             deltas[row["bucket"]] += float(row["weight"]) * float(row["llr"])
     post_buckets = categorical_posterior(prior_buckets, deltas)
 else:
@@ -372,7 +436,7 @@ st.caption("👉 The verdict. **Buy YES** = bet it happens. **Buy NO** = bet it 
 
 if is_categorical:
     rows = []
-    for k in ["below", "exactly", "above"]:
+    for k in bucket_keys:
         res_k = evaluate(
             post_buckets[k], mkt_buckets[k] - 0.005, mkt_buckets[k] + 0.005,
             bankroll=bankroll, fee=fee, edge_threshold=edge_threshold,
@@ -380,7 +444,7 @@ if is_categorical:
             hours_to_expiry=hours, min_hours=min_hours,
         )
         rows.append({
-            "bucket": k, "prior": round(prior_buckets[k], 3),
+            "outcome": bucket_labels[k], "prior": round(prior_buckets[k], 3),
             "posterior": round(post_buckets[k], 3),
             "market": round(mkt_buckets[k], 3),
             "edge": round(res_k.edge, 3), "side": res_k.side,
@@ -392,14 +456,14 @@ if is_categorical:
     if len(fires):
         best = fires.loc[fires["edge"].abs().idxmax()]
         st.markdown(f"### Best edge: <span class='verdict-buy'>{best['side'].replace('_',' ')} "
-                    f"'{best['bucket']}'</span> · edge {best['edge']:+.3f} · "
+                    f"'{best['outcome']}'</span> · edge {best['edge']:+.3f} · "
                     f"${best['stake $']:,.0f}", unsafe_allow_html=True)
     else:
         st.markdown("### Verdict: <span class='verdict-flat'>NO TRADE</span> "
-                    "— no bucket clears the gate.", unsafe_allow_html=True)
-    st.caption("Each bucket evaluated independently against its own price. "
+                    "— no outcome clears the gate.", unsafe_allow_html=True)
+    st.caption("Each outcome evaluated independently against its own price. "
                "Note the book overround — true edges are smaller than raw gaps.")
-    # for the shared waterfall section below, expose the 'above' bucket
+    # expose the 'above' bucket for the shared waterfall/sensitivity sections
     prior, posterior, mid = prior_buckets["above"], post_buckets["above"], mkt_buckets["above"]
     signals = []
 else:
