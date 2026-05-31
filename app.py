@@ -184,6 +184,48 @@ with st.sidebar:
                 "Keep λ low and threshold above 2× half-spread.</span>",
                 unsafe_allow_html=True)
 
+    st.divider()
+    st.subheader("Live data")
+    auto_refresh = st.checkbox(
+        "Auto-refresh quotes", value=True,
+        help="Automatically re-pull live BTC price and Hyperliquid contract "
+             "quotes on a timer, without clicking refresh.")
+    refresh_secs = st.select_slider(
+        "Refresh every", options=[10, 15, 30, 60, 120], value=30,
+        format_func=lambda s: f"{s}s",
+        disabled=not auto_refresh,
+        help="How often to re-fetch live data when auto-refresh is on.")
+
+# ---------------------------------------------------------------------------
+# auto-refresh: time-gated nonce bump. We record when we last refreshed and
+# only bump the data nonce + rerun once the chosen interval has actually
+# elapsed. This avoids the tight rerun loop a naive timer would create, while
+# still keeping live prices fresh hands-free.
+# ---------------------------------------------------------------------------
+import time as _time
+
+if "quote_nonce" not in st.session_state:
+    st.session_state.quote_nonce = 0
+if "last_refresh" not in st.session_state:
+    st.session_state.last_refresh = _time.time()
+
+if auto_refresh:
+    try:
+        @st.fragment(run_every=2)
+        def _auto_refresh_ticker():
+            elapsed = _time.time() - st.session_state.last_refresh
+            remaining = max(0, int(refresh_secs - elapsed))
+            st.caption(f"⏱️ Auto-refresh in {remaining}s "
+                       f"(every {refresh_secs}s)")
+            if elapsed >= refresh_secs:
+                st.session_state.last_refresh = _time.time()
+                st.session_state.quote_nonce += 1
+                st.rerun(scope="app")
+        _auto_refresh_ticker()
+    except Exception:
+        # very old Streamlit without fragment/run_every: degrade silently
+        pass
+
 market_type = st.radio(
     "Market (live HIP-4 books, Jun 1 8:00 AM / Jun 10 CPI)",
     ["BTC > 74032", "BTC range (3-way)", "May CPI YoY (3-way)"],
@@ -290,8 +332,9 @@ if not is_categorical:
             st.session_state.quote_nonce = 0
         bqc1, bqc2 = st.columns([3, 1])
         use_live_bin = bqc1.checkbox(
-            "Use live Hyperliquid quote", value=False,
-            help="Fetch the current YES price for this contract from Hyperliquid.")
+            "Use live Hyperliquid quote", value=True,
+            help="Fetch the current YES price for this contract from Hyperliquid. "
+                 "On by default; auto-refreshes per the sidebar setting.")
         if bqc2.button("↻ Refresh quote",
                        help="Re-fetch the latest contract price now."):
             st.session_state.quote_nonce += 1
@@ -427,7 +470,7 @@ else:
 
         qc1, qc2 = st.columns([3, 1])
         use_live = qc1.checkbox(
-            "Use live Hyperliquid quotes", value=False,
+            "Use live Hyperliquid quotes", value=True,
             help="Fetch current contract prices from Hyperliquid's HIP-4 books. "
                  "If a market can't be matched, that price falls back to manual.")
         if qc2.button("↻ Refresh quotes",
