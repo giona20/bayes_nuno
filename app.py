@@ -5,6 +5,7 @@ Run: streamlit run app.py
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 
 import numpy as np
@@ -26,7 +27,22 @@ from nbes_engine import (
 from price_feed import fetch_btc_spot
 from hl_outcomes import get_outcome_prices
 
-st.set_page_config(page_title="NBES — Bayesian Edge", page_icon="📊", layout="wide")
+# Resolve the logo path relative to this file so it works from any CWD.
+_LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nuno_logo.png")
+_LOGO = _LOGO_PATH if os.path.exists(_LOGO_PATH) else None
+
+st.set_page_config(
+    page_title="NUNO · NBES — Bayesian Edge",
+    page_icon=_LOGO or "📊",   # favicon (browser tab)
+    layout="wide",
+)
+
+# Sidebar logo (also shows a small mark at top-left of the app).
+if _LOGO:
+    try:
+        st.logo(_LOGO, size="large")
+    except Exception:  # older Streamlit without st.logo
+        pass
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -60,7 +76,15 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("NBES — Bayesian Edge Dashboard")
+if _LOGO:
+    try:
+        _hc1, _hc2 = st.columns([1, 9], vertical_alignment="center")
+    except TypeError:  # older Streamlit without vertical_alignment
+        _hc1, _hc2 = st.columns([1, 9])
+    _hc1.image(_LOGO, width=72)
+    _hc2.title("NBES — Bayesian Edge Dashboard")
+else:
+    st.title("NBES — Bayesian Edge Dashboard")
 st.caption("Prior → sequential logit updating → edge vs market → variance-adjusted Kelly. "
            "HIP-4 outcome contracts settle 0/1; max loss = stake.")
 
