@@ -78,68 +78,70 @@ def fetch_l2_book(coin: str) -> dict:
 # discovery / parsing
 # ---------------------------------------------------------------------------
 
-def _iter_outcomes(meta) -> list[dict]:
-    """Flatten outcomeMeta into a list of outcome dicts, tolerant of shape.
-
-    We don't know the exact schema version live, so we defensively pull the
-    fields we need (name/description/coin encoding) wherever they appear.
-    """
-    out = []
-    container = meta
-    if isinstance(meta, dict):
-        # common keys seen in docs: "outcomes", "questions", "universe"
-        container = meta.get("outcomes") or meta.get("universe") or meta.get("questions") or []
-    if not isinstance(container, list):
-        return out
-    for item in container:
-        if not isinstance(item, dict):
-            continue
-        # a "question" may hold nested outcomes
-        nested = item.get("outcomes")
-        if isinstance(nested, list):
-            for o in nested:
-                if isinstance(o, dict):
-                    o = {**o, "_question": item.get("description") or item.get("name", "")}
-                    out.append(o)
-        else:
-            out.append(item)
-    return out
+def _iter_outcomes(meta) -> list[dict]:  # retained for back-compat; unused
+    outcomes = meta.get("outcomes", []) if isinstance(meta, dict) else []
+    return [o for o in outcomes if isinstance(o, dict)]
 
 
 def discover_markets(meta=None) -> list[dict]:
-    """Return simplified market records:
-        {name, description, sides: [{label, coin}]}
-    Side `coin` is the '#N' string usable with allMids / l2Book.
+    """Return simplified market records from the real outcomeMeta schema:
+        {outcome_id, name, description, meta (parsed pipe-fields),
+         sides: [{label, side_index, coin}]}
+
+    Coin encoding (confirmed from live data): #{outcome_id*10 + side_index},
+    where side_index is the position in sideSpecs (0 = first/Yes, 1 = second/No).
+    e.g. outcome 131 -> Yes #1310, No #1311.
     """
     if meta is None:
         meta = fetch_outcome_meta()
+    outcomes = meta.get("outcomes", []) if isinstance(meta, dict) else []
     records = []
-    for o in _iter_outcomes(meta):
-        desc = str(o.get("description") or o.get("_question") or o.get("name") or "")
-        name = str(o.get("name") or desc[:60])
+    for o in outcomes:
+        if not isinstance(o, dict):
+            continue
+        oid = o.get("outcome")
+        if oid is None:
+            continue
+        desc = str(o.get("description") or "")
+        name = str(o.get("name") or "")
+        parsed = _parse_pipe_meta(desc)
         sides = []
-        side_specs = o.get("sideSpecs") or o.get("sides") or []
-        if isinstance(side_specs, list):
-            for s in side_specs:
-                if not isinstance(s, dict):
-                    continue
-                label = str(s.get("name") or s.get("side") or "")
-                # coin encoding may be under several keys
-                coin = s.get("coin") or s.get("assetName") or s.get("encoding")
-                if coin is None and "asset" in s:
-                    coin = f"#{s['asset']}"
-                if coin is not None:
-                    sides.append({"label": label, "coin": str(coin)})
-        records.append({"name": name, "description": desc, "sides": sides})
+        for idx, s in enumerate(o.get("sideSpecs", [])):
+            if not isinstance(s, dict):
+                continue
+            sides.append({
+                "label": str(s.get("name") or ""),
+                "side_index": idx,
+                "coin": f"#{int(oid) * 10 + idx}",
+            })
+        records.append({
+            "outcome_id": int(oid), "name": name, "description": desc,
+            "meta": parsed, "sides": sides,
+        })
     return records
 
 
+def _parse_pipe_meta(desc: str) -> dict:
+    """Parse pipe-delimited metadata like
+    'class:priceBinary|underlying:BTC|targetPrice:74032|period:1d' into a dict.
+    Returns {} if the description isn't in that format."""
+    if "|" not in desc and ":" not in desc:
+        return {}
+    out = {}
+    for part in desc.split("|"):
+        if ":" in part:
+            k, _, v = part.partition(":")
+            out[k.strip().lower()] = v.strip()
+    return out
+
+
 def match_market(records: list[dict], keywords: list[str]) -> dict | None:
-    """Find the first market whose name/description contains ALL keywords
-    (case-insensitive). Returns the record or None."""
+    """Find the first market whose name + description + parsed-meta values
+    contain ALL keywords (case-insensitive)."""
     kws = [k.lower() for k in keywords]
     for r in records:
-        hay = (r["name"] + " " + r["description"]).lower()
+        hay = (r["name"] + " " + r["description"] + " "
+               + " ".join(str(v) for v in r["meta"].values())).lower()
         if all(k in hay for k in kws):
             return r
     return None
@@ -174,31 +176,78 @@ def get_outcome_prices(keyword_map: dict[str, list[str]]) -> dict:
         return result
 
     any_hit = False
+    diag = []  # per-bucket trace, surfaced on total failure
+    by_id = {r["outcome_id"]: r for r in records}
     for bucket, kws in keyword_map.items():
-        rec = match_market(records, kws)
         price = None
         coin = None
+        rec = None
+        # A bucket can be pinned to an explicit outcome id via "outcome:NNN"
+        # (or an int), bypassing fragile text matching. Otherwise match by text.
+        pinned = _explicit_outcome_id(kws)
+        if pinned is not None:
+            rec = by_id.get(pinned)
+        else:
+            rec = match_market(records, kws)
         if rec and rec["sides"]:
-            # prefer the YES side
             yes = next((s for s in rec["sides"]
                         if s["label"].lower() in ("yes", "y")), rec["sides"][0])
             coin = yes["coin"]
-            if coin in mids:
-                try:
-                    price = float(mids[coin])
-                except (TypeError, ValueError):
-                    price = None
-            if price is None:
-                book = fetch_l2_book(coin)
-                price = book.get("mid")
+            if coin is not None:
+                price = _lookup_mid(coin, mids)
+                if price is None:
+                    try:
+                        price = fetch_l2_book(coin).get("mid")
+                    except Exception:  # noqa: BLE001
+                        price = None
+            diag.append(f"{bucket}: matched '{rec['name'][:30]}' "
+                        f"(outcome {rec['outcome_id']}) coin={coin} price={price}")
+        else:
+            diag.append(f"{bucket}: no market matched {kws}")
         result["prices"][bucket] = price
         result["resolved"][bucket] = coin
         any_hit = any_hit or (price is not None)
 
     result["ok"] = any_hit
+    result["diag"] = diag
     if not any_hit:
-        result["error"] = "markets found but no live mids resolved"
+        result["error"] = "markets found but no live mids resolved | " + " ; ".join(diag)
     return result
+
+
+def _explicit_outcome_id(kws) -> int | None:
+    """If a keyword list pins an outcome explicitly, return its id.
+    Accepts ['outcome:133'] or [133] or ['#133']."""
+    for k in kws:
+        if isinstance(k, int):
+            return k
+        s = str(k).strip().lower()
+        if s.startswith("outcome:"):
+            tail = s.split(":", 1)[1].strip().lstrip("#")
+            if tail.isdigit():
+                return int(tail)
+    return None
+
+
+def _lookup_mid(coin: str, mids: dict) -> float | None:
+    """Find a coin's mid in allMids, tolerant of key formatting.
+    Tries the coin as-is, without '#', and matching ignoring case."""
+    candidates = [coin, coin.lstrip("#"), f"#{coin.lstrip('#')}"]
+    for c in candidates:
+        if c in mids:
+            try:
+                return float(mids[c])
+            except (TypeError, ValueError):
+                return None
+    # case-insensitive / stringified scan as a last resort
+    target = coin.lstrip("#").lower()
+    for k, v in mids.items():
+        if str(k).lstrip("#").lower() == target:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+    return None
 
 
 if __name__ == "__main__":

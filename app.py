@@ -178,18 +178,25 @@ elif market_type == "BTC range (3-way)":
     cat_kind = "btc_range"
 is_categorical = cat_kind is not None
 
-# keyword maps used to match the live Hyperliquid outcome books by description.
-# These are best-effort; the UI shows what resolved so you can correct them.
+# keyword maps used to match the live Hyperliquid outcome books.
+# Matched against outcome name + description + parsed pipe-metadata
+# (case-insensitive, ALL keywords must be present). Tuned to the real schema:
+#   CPI buckets are named "Below 4.3%" / "Exactly 4.3%" / "Above 4.3%"
+#   BTC markets carry pipe-meta: underlying:BTC | targetPrice:NNNNN
 QUOTE_KEYWORDS = {
     "btc_range": {
-        "below":    ["BTC", "below", "72551"],
-        "in_range": ["BTC", "72551", "75512"],
-        "above":    ["BTC", "above", "75512"],
+        # The range market appears to be outcomes 133/134/135 (index:0/1/2).
+        # Pinned by explicit outcome id since their names are generic
+        # ("Recurring Named Outcome"). CONFIRM the index→bucket mapping with
+        # diagnose_hl2.py — adjust the ids/order if needed.
+        "below":    ["outcome:133"],   # index:0
+        "in_range": ["outcome:134"],   # index:1
+        "above":    ["outcome:135"],   # index:2
     },
     "cpi": {
-        "below":   ["CPI", "below", "4.3"],
-        "exactly": ["CPI", "4.3"],
-        "above":   ["CPI", "above", "4.3"],
+        "below":   ["below 4.3"],
+        "exactly": ["exactly 4.3"],
+        "above":   ["above 4.3"],
     },
 }
 
@@ -424,8 +431,16 @@ else:
                     st.warning("Couldn't match: " + ", ".join(missing)
                                + " — enter these manually below.")
             else:
-                st.warning(f"⚠️ Live quotes unavailable ({q['error']}). "
-                           "Using manual entry.")
+                st.warning("⚠️ Live quotes unavailable. Using manual entry.")
+                with st.expander("🔍 Why? (diagnostic)"):
+                    st.code(q.get("error") or "unknown")
+                    if q.get("diag"):
+                        for line in q["diag"]:
+                            st.text(line)
+                    st.caption("If markets matched but prices are blank, the coin "
+                               "encoding didn't resolve in allMids. Run "
+                               "`diagnose_hl.py` locally and share the output, or "
+                               "adjust QUOTE_KEYWORDS in app.py.")
 
         mkt_buckets = {}
         for k in bucket_keys:
