@@ -58,6 +58,14 @@ def get_live_quotes(keyword_items: tuple, _nonce: int = 0) -> dict:
     keyword_map = {b: list(kws) for b, kws in keyword_items}
     return get_outcome_prices(keyword_map)
 
+
+def hours_until(expiry) -> float | None:
+    """Hours from now until a tz-aware expiry datetime. None if no/!past expiry."""
+    if expiry is None:
+        return None
+    delta = (expiry - datetime.now(timezone.utc)).total_seconds() / 3600.0
+    return max(0.0, delta)
+
 # ---------------------------------------------------------------------------
 # styling
 # ---------------------------------------------------------------------------
@@ -276,6 +284,15 @@ BTC_PRESETS = {
 # ---------------------------------------------------------------------------
 if not is_categorical:
     preset = BTC_PRESETS[market_type]
+
+    # Fetch the live quote ONCE up front so both the prior block (auto hours
+    # from expiry) and the market-book block (price) can use it.
+    if "quote_nonce" not in st.session_state:
+        st.session_state.quote_nonce = 0
+    _bin_kw = (("yes", ("BTC", "74032")),)
+    bin_quote = get_live_quotes(_bin_kw, st.session_state.quote_nonce)
+    auto_hours = hours_until(bin_quote.get("expiry"))
+
     left, right = st.columns([1, 1])
 
     with left:
@@ -312,9 +329,19 @@ if not is_categorical:
             help=f"The price level the bet is about. YES wins if Bitcoin ends "
                  f"{direction} this number.")
         c3, c4 = st.columns(2)
-        hours = c3.number_input(
-            "Hours to expiry (→ Jun 1 8:00 AM)", 0.0, 168.0, preset["hours"], step=0.5,
-            help="How many hours until the bet settles. Less time = less can change.")
+        if auto_hours is not None:
+            exp_dt = bin_quote["expiry"]
+            c3.caption(f"⏳ Auto from expiry: **{auto_hours:.1f}h** "
+                       f"(settles {exp_dt:%b %d %H:%M} UTC)")
+            hours = c3.number_input(
+                "Hours to expiry", 0.0, 168.0, round(auto_hours, 2), step=0.5,
+                help="Auto-computed from the contract's on-chain expiry and the "
+                     "current time. Refreshes with the live data; override if needed.")
+        else:
+            hours = c3.number_input(
+                "Hours to expiry (→ Jun 1 8:00 AM)", 0.0, 168.0,
+                preset["hours"], step=0.5,
+                help="How many hours until the bet settles. Less time = less can change.")
         vol = c4.slider(
             "Annual vol σ", 0.10, 2.00, 0.55, 0.01,
             help="How jumpy Bitcoin is. Higher = bigger expected price swings. "
@@ -328,8 +355,6 @@ if not is_categorical:
         st.caption("👉 The current price on Hyperliquid. Remember: a price of "
                    "0.05 means the market thinks there's a 5% chance.")
 
-        if "quote_nonce" not in st.session_state:
-            st.session_state.quote_nonce = 0
         bqc1, bqc2 = st.columns([3, 1])
         use_live_bin = bqc1.checkbox(
             "Use live Hyperliquid quote", value=True,
@@ -342,8 +367,7 @@ if not is_categorical:
 
         live_yes = None
         if use_live_bin:
-            kw_items = (("yes", ("BTC", "74032")),)
-            q = get_live_quotes(kw_items, st.session_state.quote_nonce)
+            q = bin_quote  # fetched once at top of binary path
             if q["ok"] and q["prices"].get("yes") is not None:
                 live_yes = float(q["prices"]["yes"])
                 age = (datetime.now(timezone.utc) - q["ts"]).total_seconds()
@@ -376,6 +400,15 @@ if not is_categorical:
 # CATEGORICAL PATH (CPI 3-way  OR  BTC range 3-way)
 # ---------------------------------------------------------------------------
 else:
+    # Fetch live quotes once up front so the prior block can derive auto hours
+    # from the contract expiry, and the book block can reuse the same result.
+    if "quote_nonce" not in st.session_state:
+        st.session_state.quote_nonce = 0
+    cat_kw_items = tuple((b, tuple(kws))
+                         for b, kws in QUOTE_KEYWORDS[cat_kind].items())
+    cat_quote = get_live_quotes(cat_kw_items, st.session_state.quote_nonce)
+    cat_auto_hours = hours_until(cat_quote.get("expiry"))
+
     left, right = st.columns([1, 1])
 
     if cat_kind == "cpi":
@@ -451,9 +484,20 @@ else:
             upper = c4.number_input(
                 "Range upper", 1.0, 1_000_000.0, 75_512.0, step=50.0,
                 help="Top of the range. Above this = 'above' outcome.")
-            hours = st.number_input(
-                "Hours to expiry (→ Jun 1 8:00 AM)", 0.0, 168.0, 11.0, step=0.5,
-                help="Hours until the bet settles.")
+            if cat_auto_hours is not None:
+                exp_dt = cat_quote["expiry"]
+                st.caption(f"⏳ Auto from expiry: **{cat_auto_hours:.1f}h** "
+                           f"(settles {exp_dt:%b %d %H:%M} UTC)")
+                hours = st.number_input(
+                    "Hours to expiry", 0.0, 168.0, round(cat_auto_hours, 2),
+                    step=0.5,
+                    help="Auto-computed from the contract's on-chain expiry and "
+                         "the current time. Refreshes with live data; override "
+                         "if needed.")
+            else:
+                hours = st.number_input(
+                    "Hours to expiry (→ Jun 1 8:00 AM)", 0.0, 168.0, 11.0, step=0.5,
+                    help="Hours until the bet settles.")
             prior_buckets = btc_range_prior(spot, lower, upper, hours, vol)
             st.caption(" · ".join(f"{bucket_labels[k]} **{prior_buckets[k]:.3f}**"
                                   for k in bucket_keys))
@@ -462,11 +506,6 @@ else:
         st.subheader("2 · Market book (per bucket)")
         st.caption("👉 The price of each of the three outcomes. Pull them live "
                    "from Hyperliquid, or enter manually.")
-
-        if "quote_nonce" not in st.session_state:
-            st.session_state.quote_nonce = 0
-        kw_items = tuple((b, tuple(kws))
-                         for b, kws in QUOTE_KEYWORDS[cat_kind].items())
 
         qc1, qc2 = st.columns([3, 1])
         use_live = qc1.checkbox(
@@ -480,7 +519,7 @@ else:
 
         live_prices = {}
         if use_live:
-            q = get_live_quotes(kw_items, st.session_state.quote_nonce)
+            q = cat_quote  # fetched once at top of categorical path
             if q["ok"]:
                 age = (datetime.now(timezone.utc) - q["ts"]).total_seconds()
                 got = {k: v for k, v in q["prices"].items() if v is not None}

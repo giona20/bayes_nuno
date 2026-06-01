@@ -178,6 +178,7 @@ def get_outcome_prices(keyword_map: dict[str, list[str]]) -> dict:
     any_hit = False
     diag = []  # per-bucket trace, surfaced on total failure
     by_id = {r["outcome_id"]: r for r in records}
+    expiry = None  # first parseable expiry from any matched market
     for bucket, kws in keyword_map.items():
         price = None
         coin = None
@@ -200,6 +201,8 @@ def get_outcome_prices(keyword_map: dict[str, list[str]]) -> dict:
                         price = fetch_l2_book(coin).get("mid")
                     except Exception:  # noqa: BLE001
                         price = None
+            if expiry is None:
+                expiry = parse_expiry(rec["meta"].get("expiry"))
             diag.append(f"{bucket}: matched '{rec['name'][:30]}' "
                         f"(outcome {rec['outcome_id']}) coin={coin} price={price}")
         else:
@@ -210,9 +213,34 @@ def get_outcome_prices(keyword_map: dict[str, list[str]]) -> dict:
 
     result["ok"] = any_hit
     result["diag"] = diag
+    result["expiry"] = expiry  # tz-aware datetime or None
     if not any_hit:
         result["error"] = "markets found but no live mids resolved | " + " ; ".join(diag)
     return result
+
+
+def parse_expiry(s) -> "datetime | None":
+    """Parse a Hyperliquid expiry tag into a tz-aware UTC datetime.
+    Handles 'YYYYMMDD-HHMM' (e.g. '20260601-0600') and a few fallbacks."""
+    if not s:
+        return None
+    s = str(s).strip()
+    fmts = ("%Y%m%d-%H%M", "%Y%m%d-%H%M%S", "%Y%m%dT%H%M", "%Y-%m-%dT%H:%M")
+    for fmt in fmts:
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    # epoch seconds/millis fallback
+    if s.isdigit():
+        v = int(s)
+        if v > 10_000_000_000:  # millis
+            v //= 1000
+        try:
+            return datetime.fromtimestamp(v, tz=timezone.utc)
+        except (ValueError, OSError):
+            return None
+    return None
 
 
 def _explicit_outcome_id(kws) -> int | None:
