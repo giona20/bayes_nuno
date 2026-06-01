@@ -24,8 +24,9 @@ from nbes_engine import (
     logit,
     posterior_from_signals,
 )
-from price_feed import fetch_btc_spot
+from price_feed import fetch_btc_spot, fetch_live_signals
 from hl_outcomes import get_outcome_prices, discover_current_markets
+from calibration_loader import load_calibration, llr_for_value, calibration_age_days
 
 # Resolve the logo path relative to this file so it works from any CWD.
 _LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nuno_logo.png")
@@ -72,6 +73,18 @@ def get_current_markets(_nonce: int = 0) -> dict:
     """Cached dynamic discovery of the current recurring BTC markets.
     ttl=60s; _nonce forces refresh. Adapts automatically when markets roll over."""
     return discover_current_markets()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_live_signals(_nonce: int = 0) -> dict:
+    """Cached live signal values (funding, OI change, momentum). ttl=30s."""
+    return fetch_live_signals()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_calibration() -> dict | None:
+    """Load calibrated LLRs from calibration.json (cached 5 min)."""
+    return load_calibration()
 
 # ---------------------------------------------------------------------------
 # styling
@@ -654,20 +667,41 @@ if is_categorical:
             deltas[row["bucket"]] += float(row["weight"]) * float(row["llr"])
     post_buckets = categorical_posterior(prior_buckets, deltas)
 else:
-    st.caption("LLR = ln P(E|YES)/P(E|NO). Positive favours YES (BTC above strike). "
-               "Weight ∈ [0,1] decays with age. Wire to Loris funding / aggr.trade.")
+    calib = get_calibration()
+    sig_vals = get_live_signals(st.session_state.quote_nonce)
+    age = calibration_age_days(calib)
+    if calib:
+        age_txt = f"calibrated {age:.1f}d ago" if age is not None else "calibrated"
+        st.caption(f"LLRs auto-filled from **live signals × calibrated history** "
+                   f"({age_txt}, {calib.get('n_samples','?')} samples). "
+                   "Positive favours YES, negative favours NO. Override if you wish.")
+    else:
+        st.caption("⚠️ No calibration.json found — LLRs default to 0 (no bias). "
+                   "Run `python calibrate_llr.py` to generate real LLRs from "
+                   "historical data, then redeploy.")
+
+    # map each live signal value to its calibrated LLR
+    f_llr, f_bin = llr_for_value(calib, "funding", sig_vals.get("funding"))
+    o_llr, o_bin = llr_for_value(calib, "oi_chg", sig_vals.get("oi_chg"))
+    m_llr, m_bin = llr_for_value(calib, "mom", sig_vals.get("mom"))
+
+    def _fmt(v, suff=""):
+        return "—" if v is None else f"{v:+.4f}{suff}"
+
     default_signals = pd.DataFrame([
-        {"signal": "Spot momentum vs strike", "llr": 0.30, "weight": 0.80, "active": True},
-        {"signal": "Funding skew (Loris 34x)", "llr": 0.15, "weight": 0.60, "active": True},
-        {"signal": "OI delta direction",       "llr": -0.10, "weight": 0.50, "active": True},
-        {"signal": "Order-book imbalance",      "llr": 0.20, "weight": 0.70, "active": True},
-        {"signal": "ETF net flow z-score",      "llr": 0.10, "weight": 0.30, "active": False},
+        {"signal": f"Spot 6h momentum ({_fmt(sig_vals.get('mom'))})",
+         "llr": round(m_llr, 4), "weight": 1.0, "active": True},
+        {"signal": f"Funding rate ({_fmt(sig_vals.get('funding'))})",
+         "llr": round(f_llr, 4), "weight": 1.0, "active": True},
+        {"signal": f"OI 1h change ({_fmt(sig_vals.get('oi_chg'))})",
+         "llr": round(o_llr, 4), "weight": 1.0, "active": True},
     ])
     edited = st.data_editor(
         default_signals, num_rows="dynamic", width='stretch',
         column_config={
-            "signal": st.column_config.TextColumn("Signal", width="large"),
-            "llr": st.column_config.NumberColumn("LLR", step=0.05, format="%.2f"),
+            "signal": st.column_config.TextColumn("Signal (live value)", width="large"),
+            "llr": st.column_config.NumberColumn("LLR (calibrated)", step=0.05,
+                                                 format="%.3f"),
             "weight": st.column_config.NumberColumn("Weight", min_value=0.0,
                                                     max_value=1.0, step=0.05, format="%.2f"),
             "active": st.column_config.CheckboxColumn("On"),

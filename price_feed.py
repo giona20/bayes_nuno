@@ -88,5 +88,51 @@ def fetch_btc_spot() -> dict:
     }
 
 
+def fetch_live_signals() -> dict:
+    """Current values of the calibrated signals, from Binance USDⓈ-M futures
+    (public, no key). Returns {funding, oi_chg, mom, ok, error}. Any field that
+    fails is None; the caller maps None -> LLR 0 (no bias)."""
+    out = {"funding": None, "oi_chg": None, "mom": None,
+           "ok": False, "error": None}
+    errs = []
+
+    # funding (latest premiumIndex carries lastFundingRate)
+    try:
+        d = _get_json("https://fapi.binance.com/fapi/v1/premiumIndex"
+                      "?symbol=BTCUSDT")
+        out["funding"] = float(d["lastFundingRate"])
+    except Exception as e:  # noqa: BLE001
+        errs.append(f"funding:{type(e).__name__}")
+
+    # OI change: last two hourly OI points
+    try:
+        d = _get_json("https://fapi.binance.com/futures/data/openInterestHist"
+                      "?symbol=BTCUSDT&period=1h&limit=2")
+        if isinstance(d, list) and len(d) >= 2:
+            prev = float(d[0]["sumOpenInterest"])
+            now = float(d[1]["sumOpenInterest"])
+            if prev:
+                out["oi_chg"] = (now - prev) / prev
+    except Exception as e:  # noqa: BLE001
+        errs.append(f"oi:{type(e).__name__}")
+
+    # 6h momentum from hourly klines
+    try:
+        d = _get_json("https://fapi.binance.com/fapi/v1/klines"
+                      "?symbol=BTCUSDT&interval=1h&limit=7")
+        if isinstance(d, list) and len(d) >= 7:
+            c_now = float(d[-1][4])
+            c_6h = float(d[0][4])
+            if c_6h:
+                out["mom"] = (c_now - c_6h) / c_6h
+    except Exception as e:  # noqa: BLE001
+        errs.append(f"mom:{type(e).__name__}")
+
+    out["ok"] = any(out[k] is not None for k in ("funding", "oi_chg", "mom"))
+    out["error"] = "; ".join(errs) or None
+    return out
+
+
 if __name__ == "__main__":
     print(fetch_btc_spot())
+    print(fetch_live_signals())

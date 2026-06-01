@@ -17,8 +17,37 @@ sizing, with trade gates (min edge, model SE, time-to-expiry, positive EV).
 
 ## Files
 - `nbes_engine.py` — pure, testable engine (priors, logit accumulator, edge, Kelly). No I/O.
+- `price_feed.py` — live BTC spot (multi-source) + live signal values (funding, OI change, momentum) from Binance public API. No key.
+- `hl_outcomes.py` — Hyperliquid HIP-4 client: dynamic market discovery, prices, expiry.
+- `calibrate_llr.py` — **calibration**: pulls historical BTC data from Binance, measures real LLRs per signal, writes `calibration.json`.
+- `calibration_loader.py` — maps live signal values to the calibrated LLRs.
 - `app.py` — Streamlit UI.
-- `requirements.txt` — deps.
+- `requirements.txt` — deps (all stdlib for fetching; no new packages).
+
+## Calibrating the signals (turning placeholders into real LLRs)
+The LLRs are no longer hand-picked. To generate real ones from history:
+```bash
+python calibrate_llr.py            # ~720 days of hourly data
+python calibrate_llr.py --days 365 # shorter window
+```
+This writes `calibration.json`. The app loads it and maps the **current** live
+signal values (funding rate, OI change, 6h momentum) to the LLR measured for
+that value's historical bin. Re-run the script anytime — commit the refreshed
+`calibration.json` and the app picks it up.
+
+**Keeping it updated:** schedule `calibrate_llr.py` (e.g. a daily cron or GitHub
+Action) so new settled days flow into the LLRs. Thin buckets are auto-shrunk
+toward 0 so they can't fabricate a strong signal. If `calibration.json` is
+absent, all LLRs default to 0 (prior only) — no fabricated bias.
+
+## Live contract quotes
+Each market has a **"Use live Hyperliquid quotes"** toggle. When on, the app
+queries Hyperliquid's HIP-4 books and auto-fills the contract prices, showing
+which `#N` coin resolved to each outcome so you can verify the match. The
+keyword maps that drive matching live in `QUOTE_KEYWORDS` in `app.py` — adjust
+them if the live market descriptions differ from the defaults. Recurring markets
+rotate their `#N` encodings each period, which is why discovery is dynamic
+rather than hardcoded.
 
 ## Run locally
 ```bash
