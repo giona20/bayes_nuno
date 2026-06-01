@@ -25,7 +25,7 @@ from nbes_engine import (
     posterior_from_signals,
 )
 from price_feed import fetch_btc_spot
-from hl_outcomes import get_outcome_prices
+from hl_outcomes import get_outcome_prices, discover_current_markets
 
 # Resolve the logo path relative to this file so it works from any CWD.
 _LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nuno_logo.png")
@@ -65,6 +65,13 @@ def hours_until(expiry) -> float | None:
         return None
     delta = (expiry - datetime.now(timezone.utc)).total_seconds() / 3600.0
     return max(0.0, delta)
+
+
+@st.cache_data(ttl=60, show_spinner="Discovering live Hyperliquid markets…")
+def get_current_markets(_nonce: int = 0) -> dict:
+    """Cached dynamic discovery of the current recurring BTC markets.
+    ttl=60s; _nonce forces refresh. Adapts automatically when markets roll over."""
+    return discover_current_markets()
 
 # ---------------------------------------------------------------------------
 # styling
@@ -234,50 +241,82 @@ if auto_refresh:
         # very old Streamlit without fragment/run_every: degrade silently
         pass
 
-market_type = st.radio(
-    "Market (live HIP-4 books, Jun 1 8:00 AM / Jun 10 CPI)",
-    ["BTC > 74032", "BTC range (3-way)", "May CPI YoY (3-way)"],
-    horizontal=True,
-    help="'BTC > 74032' is a yes/no bet. 'BTC range' and 'May CPI' are 3-way "
-         "markets where the three outcomes add up to 100%.",
-)
-
 # ---------------------------------------------------------------------------
-# prior block
+# DYNAMIC market discovery — adapts automatically to daily rollover.
+# Markets rotate every period (new targetPrice, expiry, and outcome ids), and
+# expired markets vanish from outcomeMeta. So we discover the CURRENT markets
+# live and build everything from that, falling back to last-known values only
+# if discovery is unavailable.
 # ---------------------------------------------------------------------------
-cat_kind = None
-if market_type == "May CPI YoY (3-way)":
-    cat_kind = "cpi"
-elif market_type == "BTC range (3-way)":
-    cat_kind = "btc_range"
-is_categorical = cat_kind is not None
+markets = get_current_markets(st.session_state.quote_nonce)
 
-# keyword maps used to match the live Hyperliquid outcome books.
-# Matched against outcome name + description + parsed pipe-metadata
-# (case-insensitive, ALL keywords must be present). Tuned to the real schema:
-#   CPI buckets are named "Below 4.3%" / "Exactly 4.3%" / "Above 4.3%"
-#   BTC markets carry pipe-meta: underlying:BTC | targetPrice:NNNNN
+_binfo = markets.get("btc_binary") if markets.get("ok") else None
+btc_bin_strike = _binfo["target_price"] if _binfo and _binfo["target_price"] else 74032.0
+btc_bin_label = f"BTC > {btc_bin_strike:,.0f}"
+_rinfo = markets.get("btc_range") if markets.get("ok") else None
+
+if _rinfo and len(_rinfo["outcomes"]) >= 3:
+    _outs = _rinfo["outcomes"]  # ordered below / in_range / above
+    btc_range_keywords = {
+        "below":    [f"outcome:{_outs[0]['outcome_id']}"],
+        "in_range": [f"outcome:{_outs[1]['outcome_id']}"],
+        "above":    [f"outcome:{_outs[2]['outcome_id']}"],
+    }
+else:
+    btc_range_keywords = {
+        "below":    ["outcome:133"],
+        "in_range": ["outcome:134"],
+        "above":    ["outcome:135"],
+    }
+
 QUOTE_KEYWORDS = {
-    "btc_range": {
-        # The range market appears to be outcomes 133/134/135 (index:0/1/2).
-        # Pinned by explicit outcome id since their names are generic
-        # ("Recurring Named Outcome"). CONFIRM the index→bucket mapping with
-        # diagnose_hl2.py — adjust the ids/order if needed.
-        "below":    ["outcome:133"],   # index:0
-        "in_range": ["outcome:134"],   # index:1
-        "above":    ["outcome:135"],   # index:2
-    },
+    "btc_range": btc_range_keywords,
     "cpi": {
         "below":   ["below 4.3"],
         "exactly": ["exactly 4.3"],
         "above":   ["above 4.3"],
     },
 }
-
-# market presets pulled from the live books in the screenshots
 BTC_PRESETS = {
-    "BTC > 74032": {"strike": 74032.0, "yes_mkt": 0.05, "hours": 11.0, "direction": "above"},
+    btc_bin_label: {"strike": btc_bin_strike, "yes_mkt": 0.05,
+                    "hours": 11.0, "direction": "above"},
 }
+
+# status line so you can see what's live and when it rolls over
+if markets.get("ok"):
+    bits = []
+    if _binfo:
+        eh = hours_until(_binfo["expiry"])
+        bits.append(f"binary {btc_bin_label}"
+                    + (f" · {eh:.1f}h left" if eh is not None else ""))
+    if _rinfo:
+        bits.append(f"range {len(_rinfo['outcomes'])}-way")
+    st.caption("🟢 Live markets: " + " | ".join(bits)
+               + " — auto-updates when markets roll over.")
+else:
+    st.caption("⚪ Live market discovery unavailable; using last-known market "
+               "definitions. Prices/strikes may be stale until reconnected.")
+
+_BIN_CHOICE = btc_bin_label
+_RANGE_CHOICE = "BTC range (3-way)"
+_CPI_CHOICE = "May CPI YoY (3-way)"
+market_type = st.radio(
+    "Market (live HIP-4 books — refreshes automatically each day)",
+    [_BIN_CHOICE, _RANGE_CHOICE, _CPI_CHOICE],
+    horizontal=True,
+    help="The BTC binary's strike updates daily as the market rolls over. "
+         "3-way markets settle across three outcomes that add to 100%.",
+)
+
+# ---------------------------------------------------------------------------
+# prior block
+# ---------------------------------------------------------------------------
+cat_kind = None
+if market_type == _CPI_CHOICE:
+    cat_kind = "cpi"
+elif market_type == _RANGE_CHOICE:
+    cat_kind = "btc_range"
+is_categorical = cat_kind is not None
 
 # ---------------------------------------------------------------------------
 # BINARY PATH (BTC markets)
@@ -289,7 +328,12 @@ if not is_categorical:
     # from expiry) and the market-book block (price) can use it.
     if "quote_nonce" not in st.session_state:
         st.session_state.quote_nonce = 0
-    _bin_kw = (("yes", ("BTC", "74032")),)
+    # Pin to the freshly discovered binary outcome id when available; else
+    # fall back to matching by underlying + (last-known) target price.
+    if _binfo and _binfo.get("outcome_id") is not None:
+        _bin_kw = (("yes", (f"outcome:{_binfo['outcome_id']}",)),)
+    else:
+        _bin_kw = (("yes", ("BTC", f"{int(btc_bin_strike)}")),)
     bin_quote = get_live_quotes(_bin_kw, st.session_state.quote_nonce)
     auto_hours = hours_until(bin_quote.get("expiry"))
 

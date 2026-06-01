@@ -148,6 +148,120 @@ def match_market(records: list[dict], keywords: list[str]) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# dynamic discovery of the CURRENT recurring markets
+# ---------------------------------------------------------------------------
+# Recurring markets rotate every period (targetPrice + expiry change, and for
+# categorical markets the outcome IDs change). Expired markets are removed from
+# outcomeMeta, so whatever is present IS current. We therefore select markets by
+# their STABLE metadata (class + underlying + period), never by hardcoded id.
+
+def find_btc_binary(records: list[dict]) -> dict | None:
+    """The current daily BTC price binary: class=priceBinary, underlying=BTC.
+    Returns the record (with live targetPrice + expiry in .meta) or None."""
+    best = None
+    for r in records:
+        m = r["meta"]
+        if m.get("class", "").lower() == "pricebinary" \
+                and m.get("underlying", "").upper() == "BTC" \
+                and "targetprice" in m:
+            # prefer the soonest-expiry instance if several are present
+            if best is None:
+                best = r
+            else:
+                e1, e2 = parse_expiry(r["meta"].get("expiry")), \
+                    parse_expiry(best["meta"].get("expiry"))
+                if e1 and (not e2 or e1 < e2):
+                    best = r
+    return best
+
+
+def find_btc_range(records: list[dict]) -> list[dict] | None:
+    """The current BTC range (multi-outcome) market as an ordered list of
+    outcome records [below, in_range, above].
+
+    Strategy: look for priceBucket-class BTC outcomes, OR the 'Recurring Named
+    Outcome' triplet tagged index:0/1/2. Returns them ordered by index, or None.
+    """
+    # 1. explicit priceBucket class with underlying BTC
+    buckets = [r for r in records
+               if r["meta"].get("class", "").lower() in ("pricebucket", "pricerange")
+               and r["meta"].get("underlying", "").upper() == "BTC"]
+    if len(buckets) >= 3:
+        buckets.sort(key=lambda r: _index_of(r))
+        return buckets[:3]
+
+    # 2. fallback: the 'Recurring Named Outcome' index:0/1/2 triplet
+    named = [r for r in records
+             if "named outcome" in r["name"].lower()
+             and "index" in r["meta"]]
+    if len(named) >= 3:
+        named.sort(key=lambda r: _index_of(r))
+        return named[:3]
+    return None
+
+
+def _index_of(rec: dict) -> int:
+    """Pull the numeric 'index:N' from meta, else fall back to outcome_id."""
+    v = rec["meta"].get("index")
+    if v is not None and str(v).lstrip("-").isdigit():
+        return int(v)
+    return rec["outcome_id"]
+
+
+def discover_current_markets() -> dict:
+    """One-shot discovery of the live recurring markets, fully dynamic.
+
+    Returns {'ok', 'ts', 'error',
+             'btc_binary': {targetPrice, expiry, coin_yes, ...} | None,
+             'btc_range':  {bounds, outcomes:[{label,coin,index}], expiry} | None}
+    """
+    res = {"ok": False, "ts": datetime.now(timezone.utc), "error": None,
+           "btc_binary": None, "btc_range": None}
+    try:
+        recs = discover_markets(fetch_outcome_meta())
+    except Exception as e:  # noqa: BLE001
+        res["error"] = f"{type(e).__name__}: {e}"
+        return res
+
+    b = find_btc_binary(recs)
+    if b and b["sides"]:
+        yes = next((s for s in b["sides"] if s["label"].lower() in ("yes", "y")),
+                   b["sides"][0])
+        res["btc_binary"] = {
+            "outcome_id": b["outcome_id"],
+            "target_price": _to_float(b["meta"].get("targetprice")),
+            "expiry": parse_expiry(b["meta"].get("expiry")),
+            "coin_yes": yes["coin"],
+            "period": b["meta"].get("period"),
+        }
+
+    rng = find_btc_range(recs)
+    if rng:
+        outs = []
+        for i, r in enumerate(rng):
+            yes = next((s for s in r["sides"] if s["label"].lower() in ("yes", "y")),
+                       r["sides"][0])
+            outs.append({"label": r["name"], "index": _index_of(r),
+                         "coin": yes["coin"], "outcome_id": r["outcome_id"]})
+        res["btc_range"] = {
+            "outcomes": outs,  # ordered below / in_range / above
+            "expiry": parse_expiry(rng[0]["meta"].get("expiry")),
+        }
+
+    res["ok"] = res["btc_binary"] is not None or res["btc_range"] is not None
+    if not res["ok"]:
+        res["error"] = "no live BTC recurring markets found in outcomeMeta"
+    return res
+
+
+def _to_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
 # high-level: get live prices for a set of named buckets
 # ---------------------------------------------------------------------------
 
