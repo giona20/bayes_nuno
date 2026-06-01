@@ -46,8 +46,13 @@ OUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration
 
 # settlement reference hour (UTC) for the daily BTC market
 SETTLE_HOUR_UTC = 6
-# minimum observations in a bucket before we trust its LLR; below this we shrink
-MIN_OBS = 30
+# A bin's LLR is only fully trusted once it has FULL_TRUST_OBS observations.
+# Below that it is linearly shrunk toward 0 (no signal). Below MIN_TRUST_OBS it
+# contributes nothing at all. This is what auto-suppresses a data-starved signal
+# like OI (~120 obs/bin from 30d history) until it has accumulated enough
+# history to be meaningful, while leaving momentum (3,400+/bin) at full strength.
+MIN_TRUST_OBS = 250      # below this, LLR forced to 0 (ignored)
+FULL_TRUST_OBS = 600     # at/above this, LLR used at full measured strength
 # cap on |LLR| so one noisy bucket can't dominate
 LLR_CAP = 1.5
 
@@ -224,9 +229,17 @@ def _llr_for_bins(samples, key, edges) -> dict:
         p_state_given_yes = (yes + 1) / (n_yes + len(labels))
         p_state_given_no = (no + 1) / (n_no + len(labels))
         llr = math.log(p_state_given_yes / p_state_given_no)
-        # shrink thin buckets toward 0
-        if n < MIN_OBS:
-            llr *= n / MIN_OBS
+        # Confidence shrink by sample size:
+        #   n < MIN_TRUST_OBS            -> 0 (ignore; too few samples)
+        #   MIN_TRUST_OBS..FULL_TRUST    -> linear ramp 0 -> full
+        #   n >= FULL_TRUST_OBS          -> full measured strength
+        if n < MIN_TRUST_OBS:
+            trust = 0.0
+        elif n >= FULL_TRUST_OBS:
+            trust = 1.0
+        else:
+            trust = (n - MIN_TRUST_OBS) / (FULL_TRUST_OBS - MIN_TRUST_OBS)
+        llr *= trust
         llr = max(-LLR_CAP, min(LLR_CAP, llr))
         out[lab] = {"llr": round(llr, 4), "n": n,
                     "p_yes": round(yes / n, 4) if n else None}
@@ -242,14 +255,37 @@ def _bin_labels(edges):
 
 
 INF = float("inf")
-SIGNAL_BINS = {
-    # funding rate (per 8h, decimal). negative = shorts pay, bullish-ish
-    "funding": [-INF, -0.0005, 0.0, 0.0005, INF],
-    # 1h OI change fraction
-    "oi_chg": [-INF, -0.01, 0.0, 0.01, INF],
-    # 6h momentum fraction
-    "mom": [-INF, -0.01, 0.0, 0.01, INF],
+
+# Number of equal-population quantile bins per signal. Quantile binning is used
+# instead of fixed edges because signal distributions are highly skewed (e.g.
+# BTC funding sits near a small positive value ~99% of the time) — fixed edges
+# dump almost everything into one bin and starve the others. Quantiles guarantee
+# each bin has ~equal sample count, so every LLR is backed by real observations.
+N_QUANTILE_BINS = {
+    "oi_chg": 4,
+    "mom": 5,
 }
+
+
+def _quantile_edges(values: list[float], n_bins: int) -> list[float]:
+    """Compute n_bins quantile edges from data, with -inf/inf at the ends.
+    De-duplicates collapsed edges (when many values are identical)."""
+    vals = sorted(v for v in values if v is not None)
+    if len(vals) < n_bins * 2:
+        # not enough data for quantiles; fall back to a single passthrough bin
+        return [-INF, INF]
+    inner = []
+    for i in range(1, n_bins):
+        q = i / n_bins
+        idx = int(q * (len(vals) - 1))
+        inner.append(vals[idx])
+    # dedupe while preserving order (skewed data can repeat an edge)
+    seen, uniq = set(), []
+    for e in inner:
+        if e not in seen:
+            seen.add(e)
+            uniq.append(e)
+    return [-INF] + uniq + [INF]
 
 
 def calibrate(days: int, symbol: str = "BTCUSDT") -> dict:
@@ -270,7 +306,9 @@ def calibrate(days: int, symbol: str = "BTCUSDT") -> dict:
         "settle_hour_utc": SETTLE_HOUR_UTC,
         "signals": {},
     }
-    for key, edges in SIGNAL_BINS.items():
+    for key, n_bins in N_QUANTILE_BINS.items():
+        vals = [s[key] for s in samples if s[key] is not None]
+        edges = _quantile_edges(vals, n_bins)
         result["signals"][key] = {
             "bins": _llr_for_bins(samples, key, edges),
             "edges": [e if e not in (INF, -INF) else

@@ -675,13 +675,22 @@ else:
         st.caption(f"LLRs auto-filled from **live signals × calibrated history** "
                    f"({age_txt}, {calib.get('n_samples','?')} samples). "
                    "Positive favours YES, negative favours NO. Override if you wish.")
+        if not sig_vals.get("ok"):
+            st.warning("⚠️ Live signal values unavailable right now (shown as '—'), "
+                       "so LLRs fall back to 0. This usually means the data "
+                       "endpoints are blocked from the server (e.g. Binance geo-block). "
+                       f"Detail: {sig_vals.get('error') or 'unknown'}")
+        else:
+            srcs = sig_vals.get("sources", {})
+            if srcs:
+                st.caption("Live signal sources: "
+                           + ", ".join(f"{k}→{v}" for k, v in srcs.items()))
     else:
         st.caption("⚠️ No calibration.json found — LLRs default to 0 (no bias). "
                    "Run `python calibrate_llr.py` to generate real LLRs from "
                    "historical data, then redeploy.")
 
     # map each live signal value to its calibrated LLR
-    f_llr, f_bin = llr_for_value(calib, "funding", sig_vals.get("funding"))
     o_llr, o_bin = llr_for_value(calib, "oi_chg", sig_vals.get("oi_chg"))
     m_llr, m_bin = llr_for_value(calib, "mom", sig_vals.get("mom"))
 
@@ -691,8 +700,6 @@ else:
     default_signals = pd.DataFrame([
         {"signal": f"Spot 6h momentum ({_fmt(sig_vals.get('mom'))})",
          "llr": round(m_llr, 4), "weight": 1.0, "active": True},
-        {"signal": f"Funding rate ({_fmt(sig_vals.get('funding'))})",
-         "llr": round(f_llr, 4), "weight": 1.0, "active": True},
         {"signal": f"OI 1h change ({_fmt(sig_vals.get('oi_chg'))})",
          "llr": round(o_llr, 4), "weight": 1.0, "active": True},
     ])

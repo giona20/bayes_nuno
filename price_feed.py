@@ -88,23 +88,30 @@ def fetch_btc_spot() -> dict:
     }
 
 
+def _momentum_coinbase() -> float:
+    """6h BTC momentum from Coinbase hourly candles (fallback)."""
+    # granularity 3600 = 1h; returns [[time, low, high, open, close, volume], ...]
+    d = _get_json("https://api.exchange.coinbase.com/products/BTC-USD/candles"
+                  "?granularity=3600")
+    if isinstance(d, list) and len(d) >= 7:
+        # candles are newest-first
+        c_now = float(d[0][4])
+        c_6h = float(d[6][4])
+        if c_6h:
+            return (c_now - c_6h) / c_6h
+    raise ValueError("insufficient coinbase candles")
+
+
 def fetch_live_signals() -> dict:
-    """Current values of the calibrated signals, from Binance USDⓈ-M futures
-    (public, no key). Returns {funding, oi_chg, mom, ok, error}. Any field that
-    fails is None; the caller maps None -> LLR 0 (no bias)."""
-    out = {"funding": None, "oi_chg": None, "mom": None,
-           "ok": False, "error": None}
+    """Current values of the calibrated signals (OI change, 6h momentum).
+    Tries Binance first, falls back to Coinbase for momentum so a Binance
+    geo-block doesn't blank it. Returns {oi_chg, mom, ok, error, sources}.
+    Any field that fails everywhere is None -> LLR 0 (no bias)."""
+    out = {"oi_chg": None, "mom": None,
+           "ok": False, "error": None, "sources": {}}
     errs = []
 
-    # funding (latest premiumIndex carries lastFundingRate)
-    try:
-        d = _get_json("https://fapi.binance.com/fapi/v1/premiumIndex"
-                      "?symbol=BTCUSDT")
-        out["funding"] = float(d["lastFundingRate"])
-    except Exception as e:  # noqa: BLE001
-        errs.append(f"funding:{type(e).__name__}")
-
-    # OI change: last two hourly OI points
+    # ---- OI change: Binance only (no easy public fallback) ----
     try:
         d = _get_json("https://fapi.binance.com/futures/data/openInterestHist"
                       "?symbol=BTCUSDT&period=1h&limit=2")
@@ -113,10 +120,11 @@ def fetch_live_signals() -> dict:
             now = float(d[1]["sumOpenInterest"])
             if prev:
                 out["oi_chg"] = (now - prev) / prev
+                out["sources"]["oi_chg"] = "Binance"
     except Exception as e:  # noqa: BLE001
-        errs.append(f"oi:{type(e).__name__}")
+        errs.append(f"oi/binance:{type(e).__name__}")
 
-    # 6h momentum from hourly klines
+    # ---- 6h momentum: Binance klines, then Coinbase candles ----
     try:
         d = _get_json("https://fapi.binance.com/fapi/v1/klines"
                       "?symbol=BTCUSDT&interval=1h&limit=7")
@@ -125,10 +133,16 @@ def fetch_live_signals() -> dict:
             c_6h = float(d[0][4])
             if c_6h:
                 out["mom"] = (c_now - c_6h) / c_6h
+                out["sources"]["mom"] = "Binance"
     except Exception as e:  # noqa: BLE001
-        errs.append(f"mom:{type(e).__name__}")
+        errs.append(f"mom/binance:{type(e).__name__}")
+        try:
+            out["mom"] = _momentum_coinbase()
+            out["sources"]["mom"] = "Coinbase"
+        except Exception as e2:  # noqa: BLE001
+            errs.append(f"mom/coinbase:{type(e2).__name__}")
 
-    out["ok"] = any(out[k] is not None for k in ("funding", "oi_chg", "mom"))
+    out["ok"] = any(out[k] is not None for k in ("oi_chg", "mom"))
     out["error"] = "; ".join(errs) or None
     return out
 
